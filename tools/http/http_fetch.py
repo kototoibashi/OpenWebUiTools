@@ -23,9 +23,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
+from requests.adapters import HTTPAdapter, select_proxy
 from requests.structures import CaseInsensitiveDict
 from bs4 import BeautifulSoup, Comment
 from pydantic import BaseModel, Field
+from urllib3.connection import HTTPConnection as _U3HTTPConnection
+from urllib3.connection import HTTPSConnection as _U3HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool as _U3HTTPConnectionPool
+from urllib3.connectionpool import HTTPSConnectionPool as _U3HTTPSConnectionPool
+from urllib3.exceptions import ConnectTimeoutError as _U3ConnectTimeoutError
+from urllib3.exceptions import NewConnectionError as _U3NewConnectionError
+from urllib3.util.connection import create_connection as _u3_create_connection
 
 # lxml があれば使い、無ければ標準パーサに落ちる(requirements に lxml を足すと速くなる)
 _BS_PARSER = "html.parser" if importlib.util.find_spec("lxml") is None else "lxml"
@@ -185,19 +193,26 @@ def _normalize_allow_private(val: Any) -> str:
     return "off"
 
 
-def _blocked_host(url: str, allow_private: Any) -> str:
+def _checked_addresses(url: str, allow_private: Any) -> Tuple[List[str], str]:
     """SSRF防止。host を正規化してから解決後の IP で私有/ループバック等を拒否する。
+    検査したアドレスも返し、HTTP transport がその IP に直接接続する。
     段階(実測で 169.254 / CGNAT の扱いが変わる):
       off       私有/ループバック/link-local/multicast/unspecified/追加範囲を全部ブロック
       self_only loopback と私有LANは許可。link-local(クラウドメタデータ)・unspecified・
                 multicast・CGNAT系は許可設定に関係なくブロック(自己ホスト運用は保つ)
       all       宛先IPの範囲検査だけ緩める(scheme と host 妥当性は引き続き検査する)"""
     mode = _normalize_allow_private(allow_private)
-    p = urlsplit(url)
+    try:
+        p = urlsplit(url)
+    except ValueError:
+        return [], "Unable to parse URL host."
     host = _normalize_host(p.hostname or "")
     if not host:
-        return "Unable to parse URL host."
-    port = p.port or (443 if p.scheme == "https" else 80)
+        return [], "Unable to parse URL host."
+    try:
+        port = p.port or (443 if p.scheme == "https" else 80)
+    except ValueError:
+        return [], "Unable to parse URL port."
     addrs: List[str] = []
     try:                                  # IP リテラルは DNS を経ずに検査できる
         addrs = [str(ipaddress.ip_address(host))]
@@ -205,11 +220,13 @@ def _blocked_host(url: str, allow_private: Any) -> str:
         try:
             infos = socket.getaddrinfo(host, port)
         except socket.gaierror:
-            return "DNS resolution failed: " + host
-        addrs = [str(i[4][0]) for i in infos]
+            return [], "DNS resolution failed: " + host
+        addrs = list(dict.fromkeys(str(i[4][0]) for i in infos))
+    if not addrs:
+        return [], "DNS resolution returned no usable addresses: " + host
     for addr in addrs:
         try:
-            ip = ipaddress.ip_address(addr)
+            ip = ipaddress.ip_address(addr.split("%", 1)[0])
         except ValueError:
             continue
         why = ""
@@ -226,8 +243,96 @@ def _blocked_host(url: str, allow_private: Any) -> str:
             if bad:
                 why = "private/loopback IP"
         if why:
-            return "Blocked for security: " + host + " -> " + addr + " (" + why + ")"
-    return ""
+            return [], "Blocked for security: " + host + " -> " + addr + " (" + why + ")"
+    return addrs, ""
+
+
+def _blocked_host(url: str, allow_private: Any) -> str:
+    """Compatibility wrapper for callers that only need the rejection reason."""
+    _, error = _checked_addresses(url, allow_private)
+    return error
+
+
+class _PinnedHTTPConnection(_U3HTTPConnection):
+    """HTTP connection that never performs DNS after destination validation."""
+    def __init__(self, *args, pinned_ip: str, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(*args, **kwargs)
+
+    def _new_conn(self):
+        try:
+            return _u3_create_connection((self._pinned_ip, self.port), self.timeout,
+                                         source_address=self.source_address,
+                                         socket_options=self.socket_options)
+        except socket.timeout as e:
+            raise _U3ConnectTimeoutError(
+                self, "Connection to pinned IP " + self._pinned_ip + " timed out") from e
+        except OSError as e:
+            raise _U3NewConnectionError(
+                self, "Failed to connect to pinned IP " + self._pinned_ip + ": " + str(e)) from e
+
+
+class _PinnedHTTPSConnection(_U3HTTPSConnection):
+    """HTTPS variant: socket goes to pinned_ip while TLS still uses the URL host."""
+    def __init__(self, *args, pinned_ip: str, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(*args, **kwargs)
+
+    def _new_conn(self):
+        try:
+            return _u3_create_connection((self._pinned_ip, self.port), self.timeout,
+                                         source_address=self.source_address,
+                                         socket_options=self.socket_options)
+        except socket.timeout as e:
+            raise _U3ConnectTimeoutError(
+                self, "Connection to pinned IP " + self._pinned_ip + " timed out") from e
+        except OSError as e:
+            raise _U3NewConnectionError(
+                self, "Failed to connect to pinned IP " + self._pinned_ip + ": " + str(e)) from e
+
+
+class _PinnedHTTPPool(_U3HTTPConnectionPool):
+    ConnectionCls = _PinnedHTTPConnection
+
+
+class _PinnedHTTPSPool(_U3HTTPSConnectionPool):
+    ConnectionCls = _PinnedHTTPSConnection
+
+
+class _PinnedIPAdapter(HTTPAdapter):
+    """Requests adapter that connects to a previously checked IP, preserving URL host/TLS."""
+    def __init__(self, pinned_ip: str):
+        self.pinned_ip = pinned_ip
+        super().__init__(max_retries=0)
+
+    def _pool_for(self, scheme: str, host: str, port: Optional[int], pool_kwargs=None):
+        if scheme not in ("http", "https") or not host:
+            raise requests.exceptions.InvalidURL("Only http/https URLs with a host are allowed")
+        kwargs = dict(pool_kwargs or {})
+        kwargs["pinned_ip"] = self.pinned_ip
+        if scheme == "https":
+            # Keep certificate verification and SNI bound to the original hostname.
+            kwargs["assert_hostname"] = host
+            pool = _PinnedHTTPSPool
+        else:
+            pool = _PinnedHTTPPool
+        return pool(host=host, port=port, **kwargs)
+
+    def get_connection(self, url, proxies=None):
+        if select_proxy(url, proxies):
+            raise requests.exceptions.ProxyError(
+                "HTTP proxy is incompatible with DNS-pinned SSRF protection")
+        p = urlsplit(url)
+        return self._pool_for(p.scheme, p.hostname or "", p.port)
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        if select_proxy(request.url, proxies):
+            raise requests.exceptions.ProxyError(
+                "HTTP proxy is incompatible with DNS-pinned SSRF protection")
+        host_params, pool_kwargs = self.build_connection_pool_key_attributes(
+            request, verify, cert)
+        scheme = host_params.pop("scheme")
+        return self._pool_for(scheme, host_params["host"], host_params.get("port"), pool_kwargs)
 
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -592,21 +697,28 @@ def _download(url: str, v) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any
         "Accept-Language": "ja,en;q=0.8",
     }
     sess = requests.Session()
-    # ★ SSRF: requests の自動リダイレクト追従(allow_redirects=True)は、
-    #    呼び出し元の _blocked_host 検査を「通過した後」に Location 経由で
-    #    私有IP・リンクローカル(169.254メタデータ)・loopback へ抜ける。
-    #    さかい自動追従を切って、hop 毎に自分(_download)が宛先検査し直す。
+    # SSRF: disable automatic redirects and validate every hop. Each hop's
+    # checked IP is pinned by the transport adapter, so requests cannot resolve
+    # the hostname again and land on a private address after validation.
+    # Proxies are rejected by the adapter because they would resolve the origin
+    # outside this process and bypass the pinned destination.
     max_hops = max(0, int(v.MAX_REDIRECTS))
     allow_private = _normalize_allow_private(getattr(v, "ALLOW_PRIVATE_HOSTS", "off"))   # bool valve 名はそのまま値だけ 3 値化
     current = (url or "").strip()          # 渡されたURLをそのまま送る(canon は cache key 専用)
+    pinned_adapter = _PinnedIPAdapter("0.0.0.0")
+    sess.mount("http://", pinned_adapter)
+    sess.mount("https://", pinned_adapter)
     r = None
     hops = 0
     while True:
-        blocked = _blocked_host(current, allow_private)     # ★ hop 毎に検査(1回目と同じ関数)
+        addresses, blocked = _checked_addresses(current, allow_private)
         if blocked:
             if hops == 0:
                 return None, blocked, {"url": current}
             return None, blocked + " (redirect target, hop " + str(hops) + ")", {"url": current}
+        # Pin the socket destination to the exact address set that passed checks.
+        # The request URL remains unchanged for Host routing and TLS verification.
+        pinned_adapter.pinned_ip = addresses[0]
         try:
             r = sess.get(current, timeout=v.TIMEOUT, headers=headers, stream=True,
                          allow_redirects=False)             # ★ 自前で追う
@@ -795,12 +907,24 @@ def _extract_html(text: str, base_url: str = "") -> Dict[str, Any]:
     title = _norm(soup.title.get_text(" ")) if soup.title else ""
     body = soup.body or soup
 
-    for el in body.find_all(_ALWAYS_STRIP):
-        el.decompose()
-    for c in body.find_all(string=lambda s: isinstance(s, Comment)):
-        c.extract()
+    removed = 0
 
-    before = len(_norm(body.get_text(" ")))
+    def strip_elements(elements):
+        """Remove selected elements and count their text once (outermost element only)."""
+        nonlocal removed
+        elements = list(elements)
+        selected = {id(el) for el in elements}
+        for el in elements:
+            if any(id(parent) in selected for parent in el.parents):
+                continue
+            removed += len(_norm(el.get_text(" ")))
+        for el in elements:
+            el.decompose()
+
+    strip_elements(body.find_all(_ALWAYS_STRIP))
+    for c in body.find_all(string=lambda s: isinstance(s, Comment)):
+        removed += len(_norm(str(c)))
+        c.extract()
 
     container = _pick_container(body) or _density_fallback(body) or body
 
@@ -810,7 +934,7 @@ def _extract_html(text: str, base_url: str = "") -> Dict[str, Any]:
         for el in list(body.select(selector)):
             if el is container or id(el) in anc:
                 continue
-            el.decompose()
+            strip_elements([el])
 
     # Extract link targets before reducing elements to text. These URLs are output
     # metadata only; the original request URL remains untouched.
@@ -830,8 +954,7 @@ def _extract_html(text: str, base_url: str = "") -> Dict[str, Any]:
         a.replace_with("[%s](%s)" % (label or target, target))
 
     groups = _groups_from_blocks(_blocks(container))
-    after = sum(len("\n".join(g["lines"]).strip()) for g in groups)
-    return {"title": title, "groups": groups, "removed": max(0, before - after)}
+    return {"title": title, "groups": groups, "removed": removed}
 
 
 def _pick_container(body):
@@ -885,10 +1008,22 @@ def _blocks(container) -> List[Tuple[str, Optional[str], Optional[int], List[str
 
         if name == "table":
             lines = []
+            seen_rows = set()
             for tr in el.find_all("tr"):
-                cells = [_norm(c2.get_text(" ")) for c2 in tr.find_all(["th", "td"])]
+                # An outer table's find_all("tr") also sees rows in nested tables.
+                # Those rows belong to the inner table and otherwise get emitted again.
+                if tr.find_parent("table") is not el:
+                    continue
+                cells = [_norm(c2.get_text(" ")) for c2 in tr.find_all(["th", "td"])
+                         if c2.find_parent("tr") is tr]
                 if any(cells):
-                    lines.append(" | ".join(cells))
+                    row = " | ".join(cells)
+                    # Exact duplicate rows in a table are normally template/DOM
+                    # duplication. Keep the first occurrence and preserve row order.
+                    if row in seen_rows:
+                        continue
+                    seen_rows.add(row)
+                    lines.append(row)
             if lines:
                 out.append(("b", None, None, lines, {"table"}))
             continue
@@ -1084,7 +1219,9 @@ def _split_group(g: Dict[str, Any], max_chars: int) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for i, p in enumerate(parts):
         body = p
-        if i > 0:
+        # Tables are already self-contained row records. Repeating preceding
+        # rows as context creates duplicate data and wastes the response budget.
+        if i > 0 and "table" not in g["flags"]:
             carry = "\n".join(parts[i - 1].split("\n")[-2:])
             if 0 < len(carry) <= 150 and carry not in body:
                 body = carry + "\n" + body
@@ -1243,7 +1380,7 @@ def _meta_block(entry: Dict[str, Any], cache_note: str, mode_note: str) -> List[
     out.append("received: " + _kfmt(m["bytes"]) + " bytes"
                + (" (download limit reached)" if m.get("truncated") else "")
                + " | extracted: " + _kfmt(entry["total_chars"]) + " chars ≈ " + _kfmt(entry["total_tokens"]) + " tokens"
-               + (" | removed: " + _kfmt(entry.get("removed", 0)) + " chars (HTML extraction)"
+               + (" | stripped HTML text: " + _kfmt(entry.get("removed", 0)) + " chars"
                   if m.get("is_html") else " | Markdown/text: source text preserved"))
     if entry.get("title"):
         out.append("title: " + entry["title"][:160])
@@ -1306,28 +1443,33 @@ def _render_outline_only(entry: Dict[str, Any], cache_note: str, max_rows: int =
 
 def _render_chunks(entry: Dict[str, Any], cache_note: str, ids: Sequence[str], budget: int) -> str:
     by_id = {c["id"]: c for c in entry["chunks"]}
-    out = _meta_block(entry, cache_note, " (chunk)")
-    out += ["", "Requested chunks: " + ",".join(ids) + " | response limit: " + _kfmt(budget) + " chars"]
-    used = 0
+    base = _meta_block(entry, cache_note, " (chunk)")
+    base += ["", "Requested chunks: " + ",".join(ids) + " | response limit: " + _kfmt(budget) + " chars"]
+    returned: List[str] = []
+
+    def render(returned_ids: Sequence[str], omitted_ids: Sequence[str]) -> str:
+        out = list(base)
+        for cid in returned_ids:
+            c = by_id[cid]
+            out += ["", "[" + cid + "] " + (c["head"] or "(untitled)") + _flag_note(c), c["text"]]
+        out += ["", "# CHUNK STATUS"]
+        if returned_ids:
+            out.append("Returned in full: " + _range_hint(returned_ids))
+        if omitted_ids:
+            out.append("Not returned (response limit): " + _range_hint(omitted_ids)
+                       + '. Retry with chunk="' + ",".join(omitted_ids) + '" or request fewer chunks.')
+        return "\n".join(out)
+
+    omitted = list(ids)
     for cid in ids:
-        c = by_id[cid]
-        if used >= budget:
-            out += ["", '[not returned] ' + cid + ' exceeds the limit; request chunk="' + cid + '" separately']
-            continue
-        room = budget - used
-        text = c["text"]
-        cut = ""
-        if len(text) > room:
-            text = text[:room]
-            cut = '[truncated] Partial chunk. Continue with chunk="' + cid + '" (' + _kfmt(c["chars"] - len(text)) + " chars remain)"
-        out += ["", "[" + cid + "] " + (c["head"] or "(untitled)") + _flag_note(c), text]
-        used += len(text) + 40
-        if cut:
-            out.append(cut)
-    rest = [c["id"] for c in entry["chunks"] if c["id"] not in ids]
-    if rest:
-        out += ["", "Chunks not requested: " + _range_hint(rest) + " (" + str(len(rest)) + " total)"]
-    return "\n".join(out)
+        candidate = returned + [cid]
+        candidate_omitted = [other for other in ids if other not in candidate]
+        # Count metadata, headings and status instructions too. Return whole
+        # chunks only, so the status always distinguishes complete from omitted.
+        if len(render(candidate, candidate_omitted)) <= max(0, int(budget)):
+            returned.append(cid)
+            omitted.remove(cid)
+    return render(returned, omitted)
 
 
 def _render_query(entry: Dict[str, Any], cache_note: str, q: str, window: int, budget: int) -> str:

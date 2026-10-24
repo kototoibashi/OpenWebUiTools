@@ -19,6 +19,7 @@ Open WebUI のチャットから `fetch_url` を呼び出します。最初は U
 - `refresh`: キャッシュを使わず再取得する
 
 Tool は SSRF 対策として、既定で loopback / private IP 宛てのアクセスを拒否します。`ALLOW_PRIVATE_HOSTS` Valve は用途を確認して設定してください。
+DNS 解決後は検査した IP に接続先を固定し、DNS 再解決による検査回避を防ぎます。この保護では環境変数などで設定した HTTP プロキシを使えない場合、取得をエラーにします。外部サイトへは Open WebUI 実行環境から直接接続できる必要があります。
 
 ## 導入
 
