@@ -2,7 +2,7 @@
 """
 title: HTTP Fetch (Extract -> Outline -> Chunk)
 author: custom
-description: URLから本文を抽出してchunk一覧(アウトライン)と冒頭本文を返す。続きが必要なら同じURLへ chunk / query を渡して再取得する(ダウンロードは1回だけ)。text/markdown・.md/.txt/.rst(拡張子fallback)・JSON・テキスト系に対応し、Markdown系は見出し単位でchunk化する。
+description: URLから本文とリンクID付きアウトラインを返す。リンクは同じ元URLとlink_idでたどり、続きはchunk/queryで取得する。キャッシュにより同じURLの再取得を避ける。text/markdown・.md/.txt/.rst・JSONなどに対応。
 requirements: requests, beautifulsoup4
 """
 
@@ -61,6 +61,11 @@ _WS = re.compile(r"[ \t\r\f\v]+")
 _META_CHARSET = re.compile(rb'<meta[^>]+charset=["\']?([A-Za-z0-9_\-]+)', re.I)
 _HEADER_CHARSET = re.compile(r"charset=([\w\-]+)", re.I)
 _URL_RE = re.compile(r"https?://[^\s<>\"')\]]+", re.I)
+_MAP_LINK_HOSTS = (
+    "geohack.toolforge.org", "osm4wiki.toolforge.org", "maps.google.com",
+    "google.com", "bing.com", "mapfan.com", "mapion.co.jp", "map.yahoo.co.jp",
+    "navitime.co.jp", "zenrin.co.jp",
+)
 
 # Markdown / テキスト系(拡張子・magic による fallback 用)
 _MD_HEAD_EXT = (".md", ".markdown", ".rst")
@@ -858,10 +863,12 @@ def _download(url: str, v) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any
         ex = _extract_html(text, meta.get("final") or url)
         entry["title"] = ex["title"]
         entry["removed"] = ex["removed"]
+        entry["links"] = ex.get("links", {})
         groups = ex["groups"]
     elif is_json:
         entry["title"] = ""
         entry["removed"] = 0
+        entry["links"] = {}
         groups, jnote = _json_groups(text)
         if jnote:
             entry["notes"].append(jnote)
@@ -875,6 +882,7 @@ def _download(url: str, v) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any
     else:
         entry["title"] = ""
         entry["removed"] = 0
+        entry["links"] = {}
         groups = [{"title": None, "level": None,
                   "lines": text.replace(chr(13), chr(10)).split(chr(10)), "flags": set()}]
 
@@ -936,25 +944,56 @@ def _extract_html(text: str, base_url: str = "") -> Dict[str, Any]:
                 continue
             strip_elements([el])
 
-    # Extract link targets before reducing elements to text. These URLs are output
-    # metadata only; the original request URL remains untouched.
+    # Keep link destinations out of the extracted prose. The caller can follow a
+    # page-local ID through the cached link registry instead.
+    links: Dict[str, str] = {}
     for a in list(container.find_all("a")):
         href = (a.get("href") or "").strip()
         label = _norm(a.get_text(" "))
         if not href:
             a.unwrap()
             continue
+        image = a.find("img")
+        if image and not label:
+            alt = _norm(image.get("alt") or "")
+            label = ("Image: " + alt) if alt else "Image"
+            if not alt:
+                # Bare thumbnails provide no useful destination or description.
+                a.replace_with(label)
+                continue
         target = urljoin(base_url, href)
         p = urlsplit(target)
         target = urlunsplit((p.scheme, p.netloc, p.path,
                              "&".join(x for x in p.query.split("&")
                                       if not re.match(r"(?i)^(utm_[^=]*|ref|source)=", x)), ""))
-        if a.find("img") and not label:
-            label = "Image"
-        a.replace_with("[%s](%s)" % (label or target, target))
+        if p.scheme.lower() in ("http", "https") and p.netloc:
+            link_id = "L" + str(len(links) + 1)
+            links[link_id] = target
+            link_label = "[" + link_id + "] " + (label or "Link")
+        else:
+            link_label = label or "Link"
+        base = urlsplit(base_url) if base_url else None
+        same_origin = bool(base and p.scheme in ("http", "https")
+                           and p.scheme.lower() == base.scheme.lower()
+                           and p.netloc.lower() == base.netloc.lower())
+        host = (p.hostname or "").lower()
+        is_map_service = any(host == d or host.endswith("." + d) for d in _MAP_LINK_HOSTS)
+        map_link = is_map_service and (
+            len(target) > 120 or re.search(r"(?i)(/maps?/|/m2/|[?&](lat|lon|ll|params)=)", target)
+        )
+        if same_origin:
+            # The page URL is already in the response header; avoid repeating its
+            # hostname in every internal Wikipedia link.
+            target = urlunsplit(("", "", p.path, p.query, ""))
+        if map_link:
+            # Keep the displayed coordinates or map label, but drop opaque service
+            # URLs that add tokens without helping explain the article.
+            a.replace_with(link_label if p.scheme.lower() in ("http", "https") else (label or "Map"))
+        else:
+            a.replace_with(link_label)
 
     groups = _groups_from_blocks(_blocks(container))
-    return {"title": title, "groups": groups, "removed": removed}
+    return {"title": title, "groups": groups, "removed": removed, "links": links}
 
 
 def _pick_container(body):
@@ -1380,7 +1419,7 @@ def _meta_block(entry: Dict[str, Any], cache_note: str, mode_note: str) -> List[
     out.append("received: " + _kfmt(m["bytes"]) + " bytes"
                + (" (download limit reached)" if m.get("truncated") else "")
                + " | extracted: " + _kfmt(entry["total_chars"]) + " chars ≈ " + _kfmt(entry["total_tokens"]) + " tokens"
-               + (" | stripped HTML text: " + _kfmt(entry.get("removed", 0)) + " chars"
+               + (" | explicitly stripped HTML text: " + _kfmt(entry.get("removed", 0)) + " chars"
                   if m.get("is_html") else " | Markdown/text: source text preserved"))
     if entry.get("title"):
         out.append("title: " + entry["title"][:160])
@@ -1396,6 +1435,7 @@ def _next_block(chunks: Sequence[Dict[str, Any]], incl: Sequence[str]) -> List[s
     else:
         out.append("- All chunks have been returned; no more content is available")
     out.append('- If you know a search term, use query="..." instead of chunk (headings are searched too)')
+    out.append('- Links are shown as [L1], [L2], etc. Follow one by calling fetch_url again with the same source url and link_id="L1"')
     out.append('- mode="outline"=list only / mode="raw"=raw response start / mode="all"=full text within limit / refresh=true=fetch again')
     out.append("- Request only the chunks you need")
     return out
@@ -1476,13 +1516,25 @@ def _render_query(entry: Dict[str, Any], cache_note: str, q: str, window: int, b
     text = entry["text"]
     chunks = entry["chunks"]
     out = _meta_block(entry, cache_note, " (query)")
+    regex_mode = bool(re.search(r"[|^\\[(]", q))
+    terms = [term for term in q.split() if term]
     try:
-        pat = re.compile(q, re.I) if re.search(r"[|^\\[(]", q) else re.compile(re.escape(q), re.I)
+        if regex_mode:
+            pat = re.compile(q, re.I)
+            search_note = "regex"
+        elif len(terms) > 1:
+            pat = re.compile("|".join(re.escape(term) for term in terms), re.I)
+            search_note = "any term (OR): " + " | ".join(terms)
+        else:
+            pat = re.compile(re.escape(q), re.I)
+            search_note = "literal"
     except re.error:
         pat = re.compile(re.escape(q), re.I)
+        search_note = "literal"
     hits = [mm.span() for mm in pat.finditer(text)]
     if not hits:
-        out += ["", "No matches for " + repr(q) + " (check the chunk list or try another query)", ""]
+        out += ["", "No matches for " + repr(q) + " (" + search_note
+                + "; check the chunk list or try another query)", ""]
         out += _outline(chunks, [])
         return "\n".join(out)
     spans: List[List[int]] = []
@@ -1493,7 +1545,7 @@ def _render_query(entry: Dict[str, Any], cache_note: str, q: str, window: int, b
             spans[-1][1] = max(spans[-1][1], b)
         else:
             spans.append([a, b])
-    out += ["", "query=" + repr(q) + ": " + str(len(hits)) + " matches -> " + str(len(spans))
+    out += ["", "query=" + repr(q) + " (" + search_note + "): " + str(len(hits)) + " matches -> " + str(len(spans))
             + " windows shown (" + str(window) + " chars around each match)"]
     used = 0
     for a, b in spans:
@@ -1580,11 +1632,12 @@ class Tools:
         self.valves = self.Valves()
 
     def fetch_url(self, url: str, chunk: str = "", query: str = "", mode: str = "extract",
-                  refresh: bool = False) -> str:
+                  refresh: bool = False, link_id: str = "") -> str:
         """Extract a URL and return an outline with a body preview.
 
         Start with url only. Request a range such as chunk="c3-c6" to continue,
-        or query="term" to search the cached content. Available modes are
+        or query="term" to search the cached content. To follow a link shown as
+        [L1], call again with the same source URL and link_id="L1". Available modes are
         extract, outline, raw, and all. Binary formats return metadata only.
         """
         v = self.valves
@@ -1645,6 +1698,17 @@ class Tools:
         chunks = entry.get("chunks") or []
         if not chunks:
             return _render_meta_only(entry, cache_note)
+
+        requested_link = (link_id or "").strip().upper()
+        if requested_link:
+            target = (entry.get("links") or {}).get(requested_link)
+            if not target:
+                available = ", ".join((entry.get("links") or {}).keys()) or "none"
+                return ("Unknown link_id " + repr(requested_link) + " for this cached page. Available link IDs: "
+                        + available + ". Fetch the source URL again to refresh its link IDs.")
+            followed = self.fetch_url(target)
+            return ("Followed " + requested_link + " from " + (entry.get("meta", {}).get("final") or canon)
+                    + " (source cache: " + cache_note + ")\n\n" + followed)
 
         q = (query or "").strip()
         if q:
