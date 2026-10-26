@@ -15,8 +15,9 @@ Open WebUI のチャットから `fetch_url` を呼び出します。最初は U
 
 - `url`: 取得する `http://` または `https://` URL
 - `chunk`: 例 `c3`、`c3-c6`
-- `query`: キャッシュした本文から探す語句。空白区切りの複数語は OR 検索（どれかを含む箇所）
+- `query`: キャッシュした本文から探す語句。空白区切りは同一chunk内の AND 検索、`"富士五湖 観光"` は句検索、`富士五湖 OR 観光` は OR 検索。`|` は正規表現の alternation として扱う
 - `link_id`: 本文中に表示された `[L1]` などのリンクをたどるときに指定。同じ元ページの `url` と組み合わせる（リンク先URLを引数に貼る必要なし）
+- `snapshot`: outline に表示された値。`chunk` / `query` / `link_id` の後続呼び出しで必須。ページや抽出器が変わった後に古い chunk ID が別内容を指すのを防ぐ
 - `mode`: `extract` (既定)、`outline`、`raw`、`all`
 - `refresh`: キャッシュを使わず再取得する
 

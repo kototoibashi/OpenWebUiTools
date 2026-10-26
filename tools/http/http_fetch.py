@@ -40,13 +40,18 @@ _BS_PARSER = "html.parser" if importlib.util.find_spec("lxml") is None else "lxm
 
 # Open WebUI はチャット/リクエスト単位で Tools を再生成し得るので、キャッシュはモジュールレベルに置く
 _CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_EXTRACTOR_VERSION = "5"
 
 _ALWAYS_STRIP = ["script", "style", "noscript", "template", "svg", "math", "iframe",
                  "form", "button", "input", "select", "textarea", "link", "meta"]
 _NOISE_STRIP = ["nav", "header", "footer", "aside", "[role=navigation]",
                 "[role=banner]", "[role=contentinfo]", ".sidebar", ".menu",
                 ".toc", ".table-of-contents", ".breadcrumb", ".tabs",
-                ".tablist", "[aria-label*=nav]"]
+                ".tablist", "[aria-label*=nav]", "#footer", ".site-footer",
+                ".footer-nav", ".footer-menu", ".global-nav", ".globalNav",
+                "#global-nav", "#globalNav", ".skip-link", ".skip-to-content",
+                ".skip-navigation", "[class*=skip-link]", "[id*=skip-link]",
+                ".modal-close", ".close-button", "[aria-label=close]", "[aria-label=閉じる]"]
 _CONTAINERS = ["article", "main", "[role=main]", ".markdown-body", "#readme",
                "#main-content", ".main-content", "#content", ".content",
                ".post-content", ".article-content", "#article-body", "#article",
@@ -88,7 +93,7 @@ _MD_CT_KEYS = ("markdown", "x-md", "text/md", "+md")
 _TEXT_CT_KEYS = ("plain", "csv", "javascript", "x-sh", "x-web", "x-python", "x-diff", "x-log",
                  "asciidoc")
 _MODES = ("extract", "outline", "raw", "all", "full")
-_NEGATIVE_STATUSES = {404, 410, 429, 451, 500, 502, 503, 504}
+_NEGATIVE_STATUSES = {403, 404, 410, 429, 451, 500, 502, 503, 504}
 
 
 # ---------------------------------------------------------------- helpers
@@ -816,6 +821,17 @@ def _download(url: str, v) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any
     meta["bytes"] = total
     meta["truncated"] = truncated
 
+    if r.status_code == 403:
+        server = (headers_snapshot.get("server") or "").lower()
+        body_start = data[:20000].decode("utf-8", "ignore").lower()
+        cf_challenge = (("cloudflare" in server or headers_snapshot.get("cf-mitigated", "").lower() == "challenge")
+                        and ("just a moment" in body_start or "challenge-platform" in body_start
+                             or headers_snapshot.get("cf-mitigated", "").lower() == "challenge"))
+        if cf_challenge:
+            return None, ("HTTP 403 Cloudflare browser challenge (" + r.url + ") / The server returned a JavaScript verification page, not the article. "
+                          "This fetcher does not run the challenge or reuse browser cookies. Retrying the same URL will not help; "
+                          "use an accessible mirror or provide the page text directly."), meta
+
     if r.status_code >= 400:
         reason = getattr(r, "reason", "") or ""
         return None, _status_message(r.status_code, reason, r.url, hops, (url or "").strip()), meta
@@ -841,18 +857,23 @@ def _download(url: str, v) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any
     if not is_text:
         meta["meta_only"] = True
         why = cls["skip_reason"] or ("content-type: " + (meta["ct"] or "unknown"))
-        entry = {"meta": meta, "fetched_at": time.time(), "title": "", "text": "",
+        entry = {"meta": meta, "fetched_at": time.time(), "extractor_version": _EXTRACTOR_VERSION,
+                 "title": "", "text": "",
                  "chunks": [], "total_chars": 0, "total_tokens": 0, "removed": 0, "raw": None,
                  "notes": ["Body extraction is unsupported: " + why + " (received " + _kfmt(total) + " bytes)",
                            "PDF, images, and archives are not extracted; chunk and query are unavailable for this URL.",
                            "Documentation sites may offer the same page as .md, .txt, or llms.txt."]}
+        entry["snapshot"] = hashlib.sha256(
+            (str(entry["fetched_at"]) + (meta.get("final") or url) + _EXTRACTOR_VERSION).encode()).hexdigest()[:12]
         return entry, "", meta
 
     text, charset = _decode(data, meta["ct"], headers_snapshot, None)
     meta["charset"] = charset
     meta["is_html"] = is_html
 
-    entry = {"meta": meta, "fetched_at": time.time(), "notes": []}
+    entry = {"meta": meta, "fetched_at": time.time(), "extractor_version": _EXTRACTOR_VERSION, "notes": []}
+    entry["snapshot"] = hashlib.sha256(
+        (str(entry["fetched_at"]) + (meta.get("final") or url) + _EXTRACTOR_VERSION).encode()).hexdigest()[:12]
     raw_cap = 600_000
     entry["raw"] = zlib.compress(data[:raw_cap], 6)
     entry["raw_bytes"] = total
@@ -863,11 +884,13 @@ def _download(url: str, v) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any
         ex = _extract_html(text, meta.get("final") or url)
         entry["title"] = ex["title"]
         entry["removed"] = ex["removed"]
+        entry["compacted"] = ex.get("compacted", 0)
         entry["links"] = ex.get("links", {})
         groups = ex["groups"]
     elif is_json:
         entry["title"] = ""
         entry["removed"] = 0
+        entry["compacted"] = 0
         entry["links"] = {}
         groups, jnote = _json_groups(text)
         if jnote:
@@ -875,6 +898,7 @@ def _download(url: str, v) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any
     elif cls["want_headings"]:
         entry["title"] = ""
         entry["removed"] = 0
+        entry["compacted"] = 0
         groups = _md_groups(text)
         if not cls["is_md"]:
             entry["notes"].append("Grouped content by Markdown-style headings (# / setext). "
@@ -882,6 +906,7 @@ def _download(url: str, v) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any
     else:
         entry["title"] = ""
         entry["removed"] = 0
+        entry["compacted"] = 0
         entry["links"] = {}
         groups = [{"title": None, "level": None,
                   "lines": text.replace(chr(13), chr(10)).split(chr(10)), "flags": set()}]
@@ -913,9 +938,13 @@ def _download(url: str, v) -> Tuple[Optional[Dict[str, Any]], str, Dict[str, Any
 def _extract_html(text: str, base_url: str = "") -> Dict[str, Any]:
     soup = BeautifulSoup(text, _BS_PARSER)
     title = _norm(soup.title.get_text(" ")) if soup.title else ""
+    generator = soup.find("meta", attrs={"name": re.compile(r"^generator$", re.I)})
+    is_mediawiki = bool(soup.select_one(".mw-parser-output, #mw-content-text") or
+                        (generator and re.search(r"mediawiki", generator.get("content", ""), re.I)))
     body = soup.body or soup
 
     removed = 0
+    compacted = 0
 
     def strip_elements(elements):
         """Remove selected elements and count their text once (outermost element only)."""
@@ -944,12 +973,34 @@ def _extract_html(text: str, base_url: str = "") -> Dict[str, Any]:
                 continue
             strip_elements([el])
 
+    # MediaWiki editing UI is identified structurally; never remove by visible
+    # words such as "編集", which may be ordinary article text.
+    edit_controls = (list(container.select(
+        ".mw-editsection, .mw-editsection-visualeditor, .mw-editsection-like, .wb-editpage, .mw-empty-elt"))
+        if is_mediawiki else [])
+    if edit_controls:
+        strip_elements(edit_controls)
+
     # Keep link destinations out of the extracted prose. The caller can follow a
     # page-local ID through the cached link registry instead.
     links: Dict[str, str] = {}
+    infobox_targets = set()
     for a in list(container.find_all("a")):
         href = (a.get("href") or "").strip()
         label = _norm(a.get_text(" "))
+        href_l = href.lower()
+        classes = a.get("class", [])
+        if isinstance(classes, str):
+            classes = classes.split()
+        class_l = {c.lower() for c in classes}
+        wikidata_edit = ("wikidata.org" in href_l and
+                         ("special:entitypage" in href_l or "action=edit" in href_l
+                          or "wb-editpage" in class_l or "wikibase-edit" in class_l))
+        if is_mediawiki and ("action=edit" in href_l or "veaction=edit" in href_l or wikidata_edit
+                             or "mw-editsection" in class_l or "mw-editsection-like" in class_l):
+            removed += len(label)
+            a.decompose()
+            continue
         if not href:
             a.unwrap()
             continue
@@ -959,19 +1010,18 @@ def _extract_html(text: str, base_url: str = "") -> Dict[str, Any]:
             label = ("Image: " + alt) if alt else "Image"
             if not alt:
                 # Bare thumbnails provide no useful destination or description.
-                a.replace_with(label)
+                a.decompose()
                 continue
         target = urljoin(base_url, href)
         p = urlsplit(target)
         target = urlunsplit((p.scheme, p.netloc, p.path,
                              "&".join(x for x in p.query.split("&")
                                       if not re.match(r"(?i)^(utm_[^=]*|ref|source)=", x)), ""))
-        if p.scheme.lower() in ("http", "https") and p.netloc:
-            link_id = "L" + str(len(links) + 1)
-            links[link_id] = target
-            link_label = "[" + link_id + "] " + (label or "Link")
-        else:
-            link_label = label or "Link"
+        is_http_target = p.scheme.lower() in ("http", "https") and bool(p.netloc)
+        if is_http_target:
+            next_link_id = "L" + str(len(links) + 1)
+            compacted += max(0, len("[" + (label or target) + "](" + target + ")")
+                             - len("[" + next_link_id + "] " + (label or "Link")))
         base = urlsplit(base_url) if base_url else None
         same_origin = bool(base and p.scheme in ("http", "https")
                            and p.scheme.lower() == base.scheme.lower()
@@ -981,6 +1031,33 @@ def _extract_html(text: str, base_url: str = "") -> Dict[str, Any]:
         map_link = is_map_service and (
             len(target) > 120 or re.search(r"(?i)(/maps?/|/m2/|[?&](lat|lon|ll|params)=)", target)
         )
+        parent = a.parent
+        in_infobox = False
+        while parent is not None and getattr(parent, "name", None) not in ("body", "html"):
+            classes = parent.get("class", []) if getattr(parent, "get", None) else []
+            if isinstance(classes, str):
+                classes = classes.split()
+            if any("infobox" in cls.lower() for cls in classes):
+                in_infobox = True
+                break
+            parent = getattr(parent, "parent", None)
+        if is_mediawiki and in_infobox and is_map_service:
+            removed += len(label)
+            a.decompose()
+            continue
+        dedupe_key = target.lower().rstrip("/")
+        if is_mediawiki and in_infobox and dedupe_key in infobox_targets:
+            removed += len(label)
+            a.decompose()
+            continue
+        if is_mediawiki and in_infobox:
+            infobox_targets.add(dedupe_key)
+        if is_http_target:
+            link_id = "L" + str(len(links) + 1)
+            links[link_id] = target
+            link_label = "[" + link_id + "] " + (label or "Link")
+        else:
+            link_label = label or "Link"
         if same_origin:
             # The page URL is already in the response header; avoid repeating its
             # hostname in every internal Wikipedia link.
@@ -993,7 +1070,20 @@ def _extract_html(text: str, base_url: str = "") -> Dict[str, Any]:
             a.replace_with(link_label)
 
     groups = _groups_from_blocks(_blocks(container))
-    return {"title": title, "groups": groups, "removed": removed, "links": links}
+    if is_mediawiki:
+        seen_link_rows = set()
+        for group in groups:
+            kept = []
+            for line in group["lines"]:
+                if re.search(r"\[L\d+\]", line) and line in seen_link_rows:
+                    removed += len(line)
+                    continue
+                kept.append(line)
+                if re.search(r"\[L\d+\]", line):
+                    seen_link_rows.add(line)
+            group["lines"] = kept
+    return {"title": title, "groups": groups, "removed": removed,
+            "compacted": compacted, "links": links}
 
 
 def _pick_container(body):
@@ -1120,13 +1210,21 @@ def _code_text(el) -> str:
 
 def _render_list(el, depth: int) -> List[str]:
     lines: List[str] = []
+    seen_link_rows = set()
     for li in el.find_all("li", recursive=False):
         dup = copy.copy(li)
         for sub in dup.find_all(["ul", "ol", "dl"], recursive=True):
             sub.extract()
         own = _norm(dup.get_text(" "))
         if own:
-            lines.append("  " * depth + "- " + own)
+            line = "  " * depth + "- " + own
+            link_ids = tuple(re.findall(r"\[L\d+\]", line))
+            if link_ids and line in seen_link_rows:
+                pass
+            else:
+                lines.append(line)
+                if link_ids:
+                    seen_link_rows.add(line)
         for sub in li.find_all(["ul", "ol"], recursive=False):
             lines.extend(_render_list(sub, depth + 1))
     return lines
@@ -1412,6 +1510,9 @@ def _meta_block(entry: Dict[str, Any], cache_note: str, mode_note: str) -> List[
     if m.get("charset"):
         line += " | charset: " + m["charset"]
     out.append(line + " | cache: " + cache_note)
+    if entry.get("snapshot"):
+        out.append("extractor: v" + str(entry.get("extractor_version", "?")) +
+                   " | snapshot: " + entry["snapshot"])
     if m.get("hops"):
         out.append("redirect: followed " + str(m["hops"]) + " hop(s) (original URL: " + (m.get("redirected_from") or "") + ")")
     if m.get("no_location"):
@@ -1419,23 +1520,26 @@ def _meta_block(entry: Dict[str, Any], cache_note: str, mode_note: str) -> List[
     out.append("received: " + _kfmt(m["bytes"]) + " bytes"
                + (" (download limit reached)" if m.get("truncated") else "")
                + " | extracted: " + _kfmt(entry["total_chars"]) + " chars ≈ " + _kfmt(entry["total_tokens"]) + " tokens"
-               + (" | explicitly stripped HTML text: " + _kfmt(entry.get("removed", 0)) + " chars"
+               + (" | stripped HTML text: " + _kfmt(entry.get("removed", 0)) + " chars"
+                  + " | link markup compacted: " + _kfmt(entry.get("compacted", 0)) + " chars"
                   if m.get("is_html") else " | Markdown/text: source text preserved"))
     if entry.get("title"):
         out.append("title: " + entry["title"][:160])
     return out
 
 
-def _next_block(chunks: Sequence[Dict[str, Any]], incl: Sequence[str]) -> List[str]:
+def _next_block(chunks: Sequence[Dict[str, Any]], incl: Sequence[str], snapshot: str = "") -> List[str]:
     out = ["# NEXT"]
     nxt = int((incl[-1] if incl else "c0")[1:]) + 1
     if nxt <= len(chunks):
-        out.append('- To continue, use the same url and specify chunk="c%d-c%d" (use chunk IDs, not character offsets)'
+        out.append('- To continue, use the same url, snapshot="' + snapshot +
+                   '", and chunk="c%d-c%d" (use chunk IDs, not character offsets)'
                    % (nxt, len(chunks)))
     else:
         out.append("- All chunks have been returned; no more content is available")
     out.append('- If you know a search term, use query="..." instead of chunk (headings are searched too)')
-    out.append('- Links are shown as [L1], [L2], etc. Follow one by calling fetch_url again with the same source url and link_id="L1"')
+    out.append('- Follow a link with the same source url, snapshot="' + snapshot + '", and link_id="L1"')
+    out.append('- Include the same snapshot with query/chunk follow-ups; it prevents stale chunk IDs from selecting different content')
     out.append('- mode="outline"=list only / mode="raw"=raw response start / mode="all"=full text within limit / refresh=true=fetch again')
     out.append("- Request only the chunks you need")
     return out
@@ -1466,7 +1570,7 @@ def _render_first(entry: Dict[str, Any], cache_note: str, budget: int, max_rows:
         out.append("[%s] %s%s" % (c["id"], c["head"] or "(untitled)", _flag_note(c)))
         out.append(c["text"])
         out.append("")
-    out += _next_block(chunks, incl)
+    out += _next_block(chunks, incl, entry.get("snapshot", ""))
     out += _notes_block(entry["notes"])
     return "\n".join(out)
 
@@ -1476,7 +1580,7 @@ def _render_outline_only(entry: Dict[str, Any], cache_note: str, max_rows: int =
     out = _meta_block(entry, cache_note, " (outline)")
     out += ["", "# OUTLINE (" + str(len(chunks)) + " chunks)"]
     out += _outline(chunks, [], max_rows)
-    out += _next_block(chunks, [])
+    out += _next_block(chunks, [], entry.get("snapshot", ""))
     out += _notes_block(entry["notes"])
     return "\n".join(out)
 
@@ -1497,7 +1601,8 @@ def _render_chunks(entry: Dict[str, Any], cache_note: str, ids: Sequence[str], b
             out.append("Returned in full: " + _range_hint(returned_ids))
         if omitted_ids:
             out.append("Not returned (response limit): " + _range_hint(omitted_ids)
-                       + '. Retry with chunk="' + ",".join(omitted_ids) + '" or request fewer chunks.')
+                       + '. Retry with chunk="' + ",".join(omitted_ids) + '" and snapshot="'
+                       + str(entry.get("snapshot", "")) + '" or request fewer chunks.')
         return "\n".join(out)
 
     omitted = list(ids)
@@ -1516,22 +1621,52 @@ def _render_query(entry: Dict[str, Any], cache_note: str, q: str, window: int, b
     text = entry["text"]
     chunks = entry["chunks"]
     out = _meta_block(entry, cache_note, " (query)")
-    regex_mode = bool(re.search(r"[|^\\[(]", q))
-    terms = [term for term in q.split() if term]
-    try:
-        if regex_mode:
+    # Double quotes preserve a phrase as one literal term. Whitespace means AND;
+    # explicit OR separates AND-groups, e.g. "foo bar OR baz".
+    tokens = [m.group(1) if m.group(1) is not None else m.group(2)
+              for m in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"|(\S+)', q)]
+    tokens = [t.replace('\\"', '"').strip('"') for t in tokens if t]
+    regex_mode = not ('"' in q or " OR " in q.upper()) and bool(re.search(r"[|^\\[(]", q))
+    groups: List[List[str]] = [[]]
+    for token in tokens:
+        if token.upper() == "OR":
+            if groups[-1]:
+                groups.append([])
+            continue
+        term = token[1:] if token.startswith("+") else token
+        if term:
+            groups[-1].append(term)
+    groups = [group for group in groups if group]
+    if regex_mode:
+        try:
             pat = re.compile(q, re.I)
             search_note = "regex"
-        elif len(terms) > 1:
-            pat = re.compile("|".join(re.escape(term) for term in terms), re.I)
-            search_note = "any term (OR): " + " | ".join(terms)
+        except re.error:
+            regex_mode = False
+    if not regex_mode:
+        if len(groups) > 1:
+            search_note = "explicit OR (AND within each group): " + " OR ".join(" & ".join(g) for g in groups)
+        elif groups and len(groups[0]) > 1:
+            search_note = "all terms (AND): " + " & ".join(groups[0])
+        elif '"' in q:
+            search_note = "exact phrase"
         else:
-            pat = re.compile(re.escape(q), re.I)
             search_note = "literal"
-    except re.error:
-        pat = re.compile(re.escape(q), re.I)
-        search_note = "literal"
-    hits = [mm.span() for mm in pat.finditer(text)]
+
+    hit_spans = []
+    if regex_mode:
+        hit_spans = [mm.span() for mm in pat.finditer(text)]
+    else:
+        # A query matches a chunk when every term in at least one OR group is
+        # present there. Windows anchor on each group's first term.
+        for c in chunks:
+            searchable = c["search"]
+            for group in groups:
+                if all(re.search(re.escape(term), searchable, re.I) for term in group):
+                    hit_spans.extend((c["start"] + mm.start(), c["start"] + mm.end())
+                                     for mm in re.finditer(re.escape(group[0]), searchable, re.I))
+    hit_spans = sorted(set(hit_spans))
+    hits = hit_spans
     if not hits:
         out += ["", "No matches for " + repr(q) + " (" + search_note
                 + "; check the chunk list or try another query)", ""]
@@ -1545,20 +1680,50 @@ def _render_query(entry: Dict[str, Any], cache_note: str, q: str, window: int, b
             spans[-1][1] = max(spans[-1][1], b)
         else:
             spans.append([a, b])
-    out += ["", "query=" + repr(q) + " (" + search_note + "): " + str(len(hits)) + " matches -> " + str(len(spans))
-            + " windows shown (" + str(window) + " chars around each match)"]
-    used = 0
-    for a, b in spans:
-        if used >= budget:
-            out.append("[Response limit reached. Request remaining chunks from the outline.]")
-            break
-        seg = text[a:b].strip()
-        room = budget - used
-        if len(seg) > room:
-            seg = seg[:room]
-        out += ["", "[" + _chunk_of(chunks, a) + "]" + (" ..." if a > 0 else "") + seg + ("..." if b < len(text) else "")]
-        used += len(seg) + 20
-    return "\n".join(out)
+    query_head = ["", "query=" + repr(q) + " (" + search_note + "): " + str(len(hits)) + " matches -> " + str(len(spans))
+                  + " candidate windows (" + str(window) + " chars around each match)"]
+    hit_chunks = {_chunk_of(chunks, a) for a, _ in hits}
+
+    def render_query_windows(indices: Sequence[int]) -> str:
+        rendered = list(out) + query_head
+        shown_chunks = set()
+        for idx in indices:
+            a, b = spans[idx]
+            seg = text[a:b].strip()
+            overlapping = [c["id"] for c in chunks if c["start"] < b and c["end"] > a]
+            shown_chunks.update(overlapping)
+            rendered += ["", "[" + ",".join(overlapping or [_chunk_of(chunks, a)]) + "]"
+                         + (" ..." if a > 0 else "") + seg + ("..." if b < len(text) else "")]
+        omitted_chunks = sorted(hit_chunks - shown_chunks, key=lambda cid: int(cid[1:]))
+        omitted_window_chunks = set()
+        for idx, (a, b) in enumerate(spans):
+            if idx not in indices:
+                omitted_window_chunks.update(c["id"] for c in chunks
+                                             if c["start"] < b and c["end"] > a)
+        omitted_hits = hits[60:]
+        omitted_window_chunks.update(_chunk_of(chunks, a) for a, _ in omitted_hits)
+        omitted_chunks = sorted(set(omitted_chunks) | omitted_window_chunks,
+                                key=lambda cid: int(cid[1:]))
+        rendered += ["", "# CHUNK STATUS"]
+        if shown_chunks:
+            rendered.append("Chunks represented in query windows (partial context): " +
+                            _range_hint(sorted(shown_chunks, key=lambda cid: int(cid[1:]))))
+        if omitted_chunks:
+            rendered.append("Omitted query windows: " + str(len(spans) - len(indices)) +
+                            "; additional matches skipped at 60-hit cap: " + str(len(omitted_hits)) +
+                            "; affected matching chunks (response limit or 60-window cap): " +
+                            _range_hint(omitted_chunks) + '. Retry with chunk="' +
+                            ",".join(omitted_chunks) + '" and snapshot="' +
+                            str(entry.get("snapshot", "")) + '" for full content.')
+        rendered.append("Query windows are excerpts, not full chunks; use the suggested chunk IDs for complete text.")
+        return "\n".join(rendered)
+
+    returned: List[int] = []
+    for i in range(len(spans)):
+        candidate = returned + [i]
+        if len(render_query_windows(candidate)) <= max(0, int(budget)):
+            returned.append(i)
+    return render_query_windows(returned)
 
 
 def _render_all(entry: Dict[str, Any], cache_note: str, limit: int) -> str:
@@ -1632,12 +1797,13 @@ class Tools:
         self.valves = self.Valves()
 
     def fetch_url(self, url: str, chunk: str = "", query: str = "", mode: str = "extract",
-                  refresh: bool = False, link_id: str = "") -> str:
+                  refresh: bool = False, link_id: str = "", snapshot: str = "") -> str:
         """Extract a URL and return an outline with a body preview.
 
         Start with url only. Request a range such as chunk="c3-c6" to continue,
         or query="term" to search the cached content. To follow a link shown as
-        [L1], call again with the same source URL and link_id="L1". Available modes are
+        [L1], call again with the same source URL, link_id="L1", and snapshot from the outline.
+        Use the same snapshot for chunk/query follow-ups. Available modes are
         extract, outline, raw, and all. Binary formats return metadata only.
         """
         v = self.valves
@@ -1657,7 +1823,10 @@ class Tools:
                 if "error" in cached:
                     return (cached["error"]
                             + " [cache: retaining the same failure for " + str(left) + "s; do not resend the same URL]")
-                entry, cache_note = cached, "hit (" + str(left) + "s remaining)"
+                if cached.get("extractor_version") == _EXTRACTOR_VERSION and cached.get("snapshot"):
+                    entry, cache_note = cached, "hit (" + str(left) + "s remaining)"
+                else:
+                    cache_note = "stale cache discarded"
 
         if entry is None:
             requested = (url or "").strip()
@@ -1698,6 +1867,17 @@ class Tools:
         chunks = entry.get("chunks") or []
         if not chunks:
             return _render_meta_only(entry, cache_note)
+
+        if chunk or query or link_id:
+            expected_snapshot = str(entry.get("snapshot", ""))
+            supplied_snapshot = (snapshot or "").strip()
+            if not supplied_snapshot:
+                return ("This is a follow-up request. Pass snapshot=" + repr(expected_snapshot)
+                        + " from the outline together with chunk, query, or link_id."
+                        + " If you no longer have that outline, request mode=outline again.")
+            if supplied_snapshot != expected_snapshot:
+                return ("Snapshot mismatch: the cached page content has changed or expired."
+                        " Request mode=outline again, then use its current snapshot and chunk/link IDs.")
 
         requested_link = (link_id or "").strip().upper()
         if requested_link:
